@@ -581,6 +581,10 @@ fn vf_has_fps(vf: &str) -> bool {
 }
 
 fn parse_scale_from_vf(vf: &str, src_w: u32, src_h: u32) -> Option<(u32, u32)> {
+    // The filter chain applies scales in order, so the LAST scale determines
+    // the output size. The encoder's declared dimensions must match that one,
+    // not the first scale in the chain.
+    let mut last = None;
     for part in vf.split(',') {
         let part = part.trim();
         if let Some(args) = part.strip_prefix("scale=") {
@@ -588,10 +592,10 @@ fn parse_scale_from_vf(vf: &str, src_w: u32, src_h: u32) -> Option<(u32, u32)> {
             let (w, h) = args.split_once(':')?;
             let tw: i32 = w.parse().ok()?;
             let th: i32 = h.parse().ok()?;
-            return Some(rumpeg::filter::ScaleFilter::resolve(src_w, src_h, tw, th));
+            last = Some(rumpeg::filter::ScaleFilter::resolve(src_w, src_h, tw, th));
         }
     }
-    None
+    last
 }
 
 fn prepare_video_frame(frame: Frame, target: Option<&VideoParams>) -> Result<Frame> {
@@ -819,7 +823,7 @@ fn try_convert_video(
     let mut encoded_frames = 0u64;
     let audio_index = audio_in.as_ref().map(|s| s.index);
 
-    loop {
+    'demux: loop {
         let packet = match demuxer.read_packet() {
             Ok(p) => p,
             Err(Error::Eof) => break,
@@ -827,7 +831,10 @@ fn try_convert_video(
         };
         if packet.stream_index == in_stream.index {
             if encoded_frames >= max_frames {
-                continue;
+                // --frames reached: stop demuxing entirely instead of reading
+                // (and discarding) the rest of the file; this also stops audio
+                // from running on to EOF while the video track has ended.
+                break 'demux;
             }
             for frame in decoder.decode(&packet)? {
                 for frame in graph.run_all(frame)? {
@@ -1283,4 +1290,23 @@ fn cmd_codecs() -> Result<()> {
         println!("{kind:>2} {:<12} {}", c.name, c.long_name);
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With several scale filters the last one determines output size, so the
+    /// encoder's declared dimensions must follow it (not the first).
+    #[test]
+    fn parse_scale_uses_last_filter() {
+        assert_eq!(
+            parse_scale_from_vf("scale=640:480,scale=320:240", 1920, 1080),
+            Some((320, 240))
+        );
+        assert_eq!(
+            parse_scale_from_vf("fps=30,scale=128:72", 1920, 1080),
+            Some((128, 72))
+        );
+        assert_eq!(parse_scale_from_vf("fps=30", 1920, 1080), None);
+    }
 }
